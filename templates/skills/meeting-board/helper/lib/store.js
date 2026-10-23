@@ -3,6 +3,8 @@
 //   <data-dir>/<開始時刻>/transcript.jsonl  字幕（1 発言 1 行）
 //   <data-dir>/<開始時刻>/board.json        最新の「ここまでの話」
 //   <data-dir>/<開始時刻>/notes.md          事前メモ
+//   <data-dir>/<開始時刻>/overrides.json    人が手で直した聞くことの状態（人の操作が claude より勝つ）
+//   <data-dir>/<開始時刻>/updates.jsonl     整理 1 回ごとの数字（所要時間・費用・字数。本文は入れない）
 //   <data-dir>/settings.json                自分の表示名
 //   <data-dir>/_cwd/                        claude を走らせる空のフォルダ
 // data/ の中身は .gitignore で「コミットできない」ようにしてある。
@@ -72,6 +74,14 @@ class Store {
 
   saveBoard(board) {
     if (this.sessionDir) writeFileAtomic(path.join(this.sessionDir, 'board.json'), JSON.stringify(board, null, 2) + '\n');
+  }
+
+  appendUpdateLog(obj) {
+    if (this.sessionDir) fs.appendFileSync(path.join(this.sessionDir, 'updates.jsonl'), JSON.stringify(obj) + '\n', 'utf8');
+  }
+
+  saveOverrides(obj) {
+    if (this.sessionDir) writeFileAtomic(path.join(this.sessionDir, 'overrides.json'), JSON.stringify(obj, null, 2) + '\n');
   }
 
   saveNotes(text) {

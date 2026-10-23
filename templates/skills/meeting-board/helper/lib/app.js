@@ -12,8 +12,10 @@ const os = require('os');
 
 const { Store } = require('./store');
 const { Transcript } = require('./transcript');
-const { buildWindow, buildPrompt, shouldUpdate } = require('./prompt');
-const { extractJsonObject, normalizeBoard } = require('./extract');
+const { buildWindow, buildWindowDiff, buildPrompt, shouldUpdate } = require('./prompt');
+const { extractJsonObject } = require('./extract');
+const { normalizeBoardV2, toPromptBoard, applyOverrides, mergePatch, detailTopicIds } = require('./board');
+const { parseNotes } = require('./notes');
 const { resolveClaude, callClaude, claudeVersion } = require('./claude');
 const { buildDiagText } = require('./diag');
 const { errMsg, clip, shortenHome } = require('./util');
@@ -26,16 +28,27 @@ const MAX_NOTES_LEN = 100000;
 class MeetingBoardApp {
   constructor(options) {
     const o = options;
-    this.version = o.version || '0.1.0';
+    this.version = o.version || '0.3.0';
     this.port = o.port || 0;
     this.model = o.model || 'sonnet';
     this.intervalMs = (o.intervalSec || 60) * 1000;
     this.timeoutMs = o.timeoutMs || 120000;
     this.now = o.now || (() => Date.now());
     this.log = o.log || (() => {});
+    // エラーを黒い画面（標準出力）にも出す。字幕・事前メモと同じ並びを含む文は伏せてから渡す
+    this.warn = o.warn || (() => {});
     this.env = o.env || process.env;
     this.promptMd = fs.readFileSync(o.promptPath, 'utf8');
+    // 差分の整理（2 回目から「変わったところだけ」を返してもらう）。'full' なら毎回全体
+    this.mode = o.mode === 'diff' ? 'diff' : 'full';
+    const patchPath = o.patchPromptPath || require('path').join(require('path').dirname(o.promptPath), 'prompt_patch.md');
+    this.patchMd = this.mode === 'diff' ? fs.readFileSync(patchPath, 'utf8') : '';
+    this.fullEvery = o.fullEvery || 8; // 差分をこの回数続けたら、1 回は全体でまとめ直す
+    this.fullEveryMs = o.fullEveryMs || 600000; // または前の全体から 10 分たったら
+    this.minGapMs = this.mode === 'diff' ? o.minGapMs || 8000 : 0; // 前倒しの整理の最短の間
     this.boardHtmlPath = o.boardHtmlPath;
+    this.boardCorePath = o.boardCorePath || null;
+    this.me = o.me ? String(o.me).replace(/\s+/g, ' ').trim().slice(0, MAX_NAME_LEN) : ''; // --me（字幕に出る自分の名前）
 
     this.store = new Store(o.dataDir);
     this.settings = this.store.loadSettings();
@@ -75,16 +88,26 @@ class MeetingBoardApp {
     this.store.startSession(now);
     this.transcript = new Transcript();
     this.board = null;
+    this.overrides = {}; // 人が手で直した聞くことの状態 { q1: { state, owner, at } }（会議ごと）
     this.notes = notes || '';
     this.notesVersion = 0;
     this.notesDirty = false;
     this.lastLineCount = 0;
     this.lastTotalChars = 0;
+    this.lastTextRevision = 0;
+    this.lastEntryCount = 0;
+    this.diffsSinceFull = 0;
+    this.lastFullAt = now;
+    this.forceFull = false;
+    this.lastMode = null;
     // 帯の「最終更新・更新 N 回」と診断の件数は、会議ごとに数え直す
     this.updateCount = 0;
     this.failCount = 0;
     this.lastUpdateAt = 0;
     this.lastDurationMs = null;
+    this.lastClaudeMs = null; // claude が返した duration_ms
+    this.lastCostUsd = null; // claude が返した total_cost_usd
+    this.totalCostUsd = 0; // この会議で使った分の合計
     this.savedRevision = 0;
     this.lastSaveAt = now;
     this.lastEndAt = now;
@@ -165,8 +188,38 @@ class MeetingBoardApp {
     return n;
   }
 
+  /** 事前メモを読んだ結果（聞くこと・伝えること・こちらの理解）。メモが変わったときだけ読み直す */
+  notesSpec() {
+    if (!this._spec || this._specFor !== this.notes) {
+      this._spec = parseNotes(this.notes);
+      this._specFor = this.notes;
+    }
+    return this._spec;
+  }
+
+  /** Meet の「あなた」（__SELF__）を整理に渡すときの名前: 画面で決めた表示名 → --me → 事前メモの「自分：」→「自分」 */
   selfName() {
-    return this.settings.selfName || '自分';
+    return this.settings.selfName || this.me || this.notesSpec().me || '自分';
+  }
+
+  /** 使う人の名前（字幕でこの名前の発言は使う人のもの） */
+  userNames() {
+    const names = [];
+    for (const n of [this.selfName(), this.me, this.settings.selfName, this.notesSpec().me]) {
+      if (n && names.indexOf(n) < 0) names.push(n);
+    }
+    return names;
+  }
+
+  /** 【使う人】の節の 1 行 */
+  usersLine() {
+    const names = this.userNames();
+    return (
+      names.join('、') +
+      '（字幕でこの名前の発言は使う人のもの。Meet の字幕で「あなた」と出た発言も「' +
+      this.selfName() +
+      '」として渡しています）'
+    );
   }
 
   // ── 整理（claude への依頼） ──────────────────────────────
@@ -175,31 +228,46 @@ class MeetingBoardApp {
     this.lastError = { at, kind, message };
     this.errors.unshift({ at, kind, detail: detail || '' });
     if (this.errors.length > 5) this.errors.length = 5;
+    try {
+      this.warn('整理のエラー [' + kind + '] ' + this.scrub(detail || message || ''));
+    } catch (_) {
+      /* 表示できなくても動作には影響しない */
+    }
   }
 
   pendingChars() {
     return Math.max(0, this.transcript.totalChars() - this.lastTotalChars);
   }
 
+  /** 前回の整理のあとに字幕が変わったか（書き換えで短くなった・同じ長さで言い直した、も変化に数える） */
+  pendingChange() {
+    const chars = this.pendingChars();
+    if (chars > 0) return chars;
+    return this.transcript.textRevision !== this.lastTextRevision ? 1 : 0;
+  }
+
   tick() {
     try {
       const now = this.now();
+      this.transcript.settle(now);
       this.persist(false);
       let reason = shouldUpdate({
         inFlight: this.inFlight,
         now,
         lastEndAt: this.lastEndAt,
         blockedUntil: this.blockedUntil,
-        newChars: this.pendingChars(),
+        newChars: this.pendingChange(),
         intervalMs: this.intervalMs,
         notesDirty: this.notesDirty,
         hasTranscript: this.transcript.entries.length > 0,
+        speakerTurns: this.transcript.speakerTurnsSince(this.lastEntryCount),
+        minGapMs: this.board ? this.minGapMs : 0,
       });
       // --replay が流し終わったあとは、間隔を待たずに最後の整理を行う
       if (
         !reason &&
         this.flushNow &&
-        this.pendingChars() > 0 &&
+        this.pendingChange() > 0 &&
         !this.inFlight &&
         now >= this.blockedUntil &&
         now - this.lastEndAt >= 5000
@@ -232,24 +300,58 @@ class MeetingBoardApp {
     }
 
     this.inFlight = true;
+    this.inFlightSince = this.now();
     const token = this.sessionToken;
     const startedAt = this.now();
     const notesVersion = this.notesVersion;
     const hasNotes = !!this.notes.trim();
-    const lines = this.transcript.lines(this.selfName());
-    const snapshotLines = lines.length;
-    const snapshotChars = this.transcript.totalChars();
-    const win = buildWindow(lines, this.lastLineCount);
-    const prompt = buildPrompt({
-      promptMd: this.promptMd,
-      notes: this.notes,
-      prevBoard: this.board,
-      range: win.range,
-      lines: win.lines,
-    });
+    let snapshotLines = this.lastLineCount;
+    let snapshotChars = this.lastTotalChars;
+    let snapshotTextRev = this.lastTextRevision;
+    let snapshotEntries = this.lastEntryCount;
+    // 差分にするか: 2 回目から。全体に戻すのは、まとめ直しの時期・再生の終わり・--once・事前メモが変わった・前の差分がおかしかったとき
+    const useDiff =
+      this.mode === 'diff' &&
+      !!this.board &&
+      !this.forceFull &&
+      ['once', 'flush', 'notes'].indexOf(reason) < 0 &&
+      this.diffsSinceFull < this.fullEvery &&
+      startedAt - this.lastFullAt < this.fullEveryMs;
+    const compactIds = new Set();
 
+    // ここから先で何が起きても inFlight は必ず戻す（0.1 では窓の切り出しの例外で戻らず、
+    // 以後ずっと整理が止まった）。例外は「内部エラー」として扱い、間をあけて次の回にやり直す
     let outcome;
+    let meta = null;
+    let inChars = 0;
+    let outChars = 0;
+    let range = '';
     try {
+      const lines = this.transcript.lines(this.selfName());
+      snapshotLines = lines.length;
+      snapshotChars = this.transcript.totalChars();
+      snapshotTextRev = this.transcript.textRevision;
+      snapshotEntries = this.transcript.entries.length;
+      const win = useDiff ? buildWindowDiff(lines, this.lastLineCount) : buildWindow(lines, this.lastLineCount);
+      let prevBoard = null;
+      if (this.board) {
+        if (useDiff) {
+          const detail = detailTopicIds(this.board);
+          for (const t of this.board.topics) if (!detail.has(t.id)) compactIds.add(t.id);
+          prevBoard = toPromptBoard(this.board, { detailIds: detail });
+        } else prevBoard = toPromptBoard(this.board);
+      }
+      const prompt = buildPrompt({
+        promptMd: useDiff ? this.promptMd.replace(/\s+$/, '') + '\n\n' + this.patchMd : this.promptMd,
+        notes: this.notes,
+        prevBoard,
+        range: win.range,
+        lines: win.lines,
+        users: this.usersLine(),
+        spec: hasNotes ? this.notesSpec() : null,
+      });
+      inChars = prompt.length;
+      range = win.range;
       const r = await callClaude({
         resolved: this.resolved,
         model: this.model,
@@ -259,15 +361,45 @@ class MeetingBoardApp {
         state: this.claudeState,
         env: this.env,
       });
-      outcome = this.digest(r, hasNotes);
+      if (r && r.ok) {
+        meta = r.meta || null;
+        outChars = typeof r.text === 'string' ? r.text.length : 0;
+      }
+      outcome = this.digest(r, hasNotes, useDiff ? { compactIds } : null);
     } catch (e) {
       outcome = { ok: false, kind: 'internal', message: '内部エラー: ' + clip(errMsg(e), 160), detail: clip(errMsg(e), 160) };
+    } finally {
+      this.inFlight = false;
     }
 
     const endedAt = this.now();
-    this.inFlight = false;
     this.lastEndAt = endedAt;
     this.lastDurationMs = endedAt - startedAt;
+    // 速さと費用の記録（数字だけ）。費用は返事があった回だけ足す
+    const costUsd = meta && typeof meta.cost === 'number' ? meta.cost : null;
+    const claudeMs = meta && typeof meta.ms === 'number' ? meta.ms : null;
+    if (token === this.sessionToken) {
+      if (costUsd !== null) {
+        this.lastCostUsd = costUsd;
+        this.totalCostUsd += costUsd;
+      }
+      if (claudeMs !== null) this.lastClaudeMs = claudeMs;
+      this.safe(() =>
+        this.store.appendUpdateLog({
+          at: endedAt,
+          reason: String(reason || ''),
+          ok: !!outcome.ok,
+          kind: outcome.ok ? '' : String(outcome.kind || ''),
+          range,
+          inChars,
+          outChars,
+          mode: useDiff ? 'diff' : 'full',
+          ms: this.lastDurationMs,
+          claudeMs,
+          costUsd,
+        })
+      );
+    }
 
     if (token !== this.sessionToken) {
       // 呼び出しの最中に「新しい会議」が押された → 結果は捨てる
@@ -275,6 +407,7 @@ class MeetingBoardApp {
     }
 
     if (!outcome.ok) {
+      if (useDiff && (outcome.kind === 'bad-json' || outcome.kind === 'bad-shape')) this.forceFull = true; // 次は全体で
       this.failCount += 1;
       this.consecutiveFails += 1;
       const backoff =
@@ -292,6 +425,15 @@ class MeetingBoardApp {
     this.lastError = null;
     this.lastLineCount = snapshotLines;
     this.lastTotalChars = snapshotChars;
+    this.lastTextRevision = snapshotTextRev;
+    this.lastEntryCount = snapshotEntries;
+    this.lastMode = useDiff ? 'diff' : 'full';
+    if (useDiff) this.diffsSinceFull += 1;
+    else {
+      this.diffsSinceFull = 0;
+      this.lastFullAt = endedAt;
+      this.forceFull = false;
+    }
     if (this.notesVersion === notesVersion) this.notesDirty = false;
     this.safe(() => this.store.saveBoard(this.board));
     this.persist(true);
@@ -300,7 +442,7 @@ class MeetingBoardApp {
   }
 
   /** claude の返事 → ボード or エラー */
-  digest(r, hasNotes) {
+  digest(r, hasNotes, diff) {
     if (!r.ok) return r;
     const obj = extractJsonObject(r.text);
     if (!obj) {
@@ -311,7 +453,20 @@ class MeetingBoardApp {
         detail: 'JSON が見つからない返事（' + r.text.length + ' 文字）',
       };
     }
-    const norm = normalizeBoard(obj, { hasNotes });
+    let raw = obj;
+    if (diff) {
+      // 差分の返事を前回のボードに重ねる（全体の形で返ってきても同じく重ねる。省いて渡した話題の中身を消さないため）
+      raw = mergePatch(this.board, obj, diff);
+      if (!raw) {
+        return {
+          ok: false,
+          kind: 'bad-shape',
+          message: 'claude の差分の返事の形が想定と違いました。前のボードを残し、次は全体で整理し直します。',
+          detail: 'patch の形が違う',
+        };
+      }
+    }
+    const norm = normalizeBoardV2(raw, { hasNotes, spec: this.notesSpec(), prev: this.board, users: this.userNames(), now: this.now() });
     if (!norm.ok) {
       return {
         ok: false,
@@ -320,7 +475,28 @@ class MeetingBoardApp {
         detail: norm.error,
       };
     }
-    return { ok: true, board: norm.board };
+    return { ok: true, board: applyOverrides(norm.board, this.overrides, { spec: this.notesSpec() }) };
+  }
+
+  /**
+   * 人が聞くことの状態を直す（済／持ち帰り／まだ。'auto' で claude の判断に戻す）。
+   * 戻り値: { ok:true, board } | { ok:false, status, error }
+   */
+  setOverride(id, state, owner) {
+    const key = String(id == null ? '' : id).slice(0, 20);
+    const known = new Set(this.notesSpec().items.map((x) => x.id));
+    if (this.board) for (const c of this.board.checklist || []) known.add(c.id);
+    if (!known.has(key)) return { ok: false, status: 404, error: 'その項目は聞くことの表にありません' };
+    if (state === 'auto') delete this.overrides[key];
+    else if (['done', 'deferred', 'open'].indexOf(state) >= 0) {
+      this.overrides[key] = { state, owner: String(owner == null ? '' : owner).replace(/\s+/g, ' ').trim().slice(0, 40), at: this.now() };
+    } else return { ok: false, status: 400, error: 'state は done / deferred / open / auto のどれかです' };
+    this.safe(() => this.store.saveOverrides(this.overrides));
+    if (this.board) {
+      this.board = applyOverrides(this.board, this.overrides, { spec: this.notesSpec() });
+      this.safe(() => this.store.saveBoard(this.board));
+    }
+    return { ok: true, board: this.board };
   }
 
   // ── 出力 ──────────────────────────────────────────────────
@@ -357,8 +533,15 @@ class MeetingBoardApp {
           lastAt: this.lastUpdateAt || null,
           ageSec: sec(this.lastUpdateAt),
           inFlight: this.inFlight,
+          inFlightSince: this.inFlight ? this.inFlightSince : null,
+          intervalSec: Math.round(this.intervalMs / 1000),
           pendingChars: this.pendingChars(),
           lastDurationMs: this.lastDurationMs,
+          lastClaudeMs: this.lastClaudeMs,
+          lastCostUsd: this.lastCostUsd,
+          totalCostUsd: Math.round(this.totalCostUsd * 1e6) / 1e6,
+          mode: this.mode,
+          lastMode: this.lastMode,
           failures: this.failCount,
         },
         claude: {
@@ -419,6 +602,9 @@ class MeetingBoardApp {
         inFlight: this.inFlight,
         lastAgoSec: sec(this.lastUpdateAt),
         lastDurationMs: this.lastDurationMs,
+        lastClaudeMs: this.lastClaudeMs,
+        lastCostUsd: this.lastCostUsd,
+        totalCostUsd: Math.round(this.totalCostUsd * 1e6) / 1e6,
         pendingChars: this.pendingChars(),
         notesPresent: !!this.notes.trim(),
       },

@@ -5,6 +5,8 @@
 //   STUB_MODE   ok（既定） | old-cli | error-json | limit-json | garbage | slow | exit1 | empty
 //                 old-cli   --tools / --safe-mode / --no-session-persistence を知らない古い版のふり
 //   STUB_BOARD  返すボードの JSON ファイル（無ければ内蔵の小さなボード）
+//   STUB_BOARDS 呼ばれるたびに順に返すファイル（カンマ区切り。最後のものを使い続ける。回数は STUB_LOG の行数で数える）。
+//               中身が「GARBAGE」のファイルなら JSON ではない返事をする
 //   STUB_WRAP   ボードの包み方: raw（既定）| fence | prose
 //   STUB_DELAY_MS  返事を返すまでの待ち（ミリ秒。更新の最中に別の操作が入る試験用）
 const fs = require('fs');
@@ -64,7 +66,12 @@ process.stdin.on('end', () => {
   }
 
   let board;
-  if (process.env.STUB_BOARD) {
+  if (process.env.STUB_BOARDS) {
+    const files = process.env.STUB_BOARDS.split(',');
+    const calls = process.env.STUB_LOG && fs.existsSync(process.env.STUB_LOG) ? fs.readFileSync(process.env.STUB_LOG, 'utf8').split('\n').filter(Boolean).length : 1;
+    board = fs.readFileSync(files[Math.min(calls - 1, files.length - 1)], 'utf8').trim();
+    if (board === 'GARBAGE') board = 'これは JSON ではありません';
+  } else if (process.env.STUB_BOARD) {
     board = fs.readFileSync(process.env.STUB_BOARD, 'utf8').trim();
   } else {
     board = JSON.stringify({
@@ -87,7 +94,9 @@ process.stdin.on('end', () => {
   let result = board;
   if (wrap === 'fence') result = '```json\n' + board + '\n```';
   if (wrap === 'prose') result = '整理しました。\n\n' + board + '\n\n以上です。';
-  const out = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result }) + '\n';
+  // 本物の claude -p --output-format json と同じく、費用と所要時間（数字）も付ける
+  const out =
+    JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result, total_cost_usd: Number(process.env.STUB_COST_USD || 0.0125), duration_ms: 4321 }) + '\n';
   const delay = Number(process.env.STUB_DELAY_MS || 0);
   setTimeout(() => {
     process.stdout.write(out, () => process.exit(0));

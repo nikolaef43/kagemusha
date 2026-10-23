@@ -59,6 +59,23 @@ test('GET / だけは札なしで読める。それ以外は札が無ければ 4
   }
 });
 
+test('GET / のボードには board-core.js が埋め込まれていて、外のファイルを読まない', async () => {
+  const h = await S.startApp();
+  try {
+    const home = await S.request(h.port, 'GET', '/');
+    assert.equal(home.status, 200);
+    assert.match(home.text, /MeetingBoardView/);
+    assert.ok(!home.text.includes('<!--BOARD_CORE-->'), '印が差し替わっている');
+    assert.doesNotMatch(home.text, /<script[^>]+src=/i);
+    assert.match(home.text, /次の一手/);
+    assert.match(home.text, /会議の前と後/);
+    const notes = await get(h, '/notes');
+    assert.deepEqual(notes.json.spec, { items: [], beliefs: [], me: '' }, 'GET /notes は事前メモを読んだ結果も返す');
+  } finally {
+    await h.close();
+  }
+});
+
 test('Host が 127.0.0.1 / localhost 以外なら断る（DNS リバインディング対策）', async () => {
   const h = await S.startApp();
   try {
@@ -286,6 +303,141 @@ test('整理: しきい値を満たすと偽 claude に渡り、ボードが出�
   }
 });
 
+test('整理: claude が次の一手を返さなくても、事前メモの最初の「まだ」が次の一手になる。使う人の名前が【使う人】に入る', async () => {
+  const h = await S.startApp({ fakeClock: true, notes: '自分：山田\n## 今日聞くこと\n1. 月額はいくらか\n2. 納期はいつか' });
+  try {
+    await post(h, '/captions', { entries: lines(8, 'a') });
+    h.clock.t += 30000;
+    assert.equal((await h.app.runUpdate('test')).ok, true);
+    const st = (await get(h, '/state')).json;
+    assert.deepEqual(Object.keys(st).sort(), ['board', 'notesPresent', 'recent', 'selfName', 'status'], '/state の最上位の欄は増やさない');
+    assert.equal(st.board.next_action.ref, 'q1');
+    assert.equal(st.board.next_action.by, 'rule');
+    assert.equal(st.board.next_action.text, '聞く：月額はいくらか');
+    assert.deepEqual(st.board.checklist.map((c) => [c.id, c.state]), [['q1', 'open'], ['q2', 'open']]);
+    assert.match(h.calls()[0].stdin, /【使う人】\n山田（/);
+    assert.match(h.calls()[0].stdin, /【聞くこと・伝えることの表】\nq1（聞く）: 月額はいくらか\nq2（聞く）: 納期はいつか/);
+    assert.equal(st.selfName, '', '画面で決めた表示名は変えない');
+  } finally {
+    await h.close();
+  }
+});
+
+test('人が直す: POST /override は札が要り、直した状態は保存され、次の整理でも勝ち、claude にも渡る。新しい会議で消える', async () => {
+  const h = await S.startApp({ fakeClock: true, notes: '## 今日聞くこと\n1. 月額はいくらか\n2. 納期はいつか' });
+  try {
+    assert.equal((await S.request(h.port, 'POST', '/override', { body: { id: 'q1', state: 'done' } })).status, 403, '札が無ければ断る');
+    // 整理の前に直してもよい（事前メモの項目なら）
+    assert.equal((await post(h, '/override', { target: 'checklist', id: 'q1', state: 'done' })).status, 200);
+    assert.equal((await post(h, '/override', { id: 'q9', state: 'done' })).status, 404);
+    assert.equal((await post(h, '/override', { id: 'q2', state: 'すみ' })).status, 400);
+    assert.equal((await post(h, '/override', { target: 'cards', id: 'q2', state: 'done' })).status, 400);
+    assert.equal((await S.request(h.port, 'GET', '/override', { headers: S.API })).status, 405);
+
+    await post(h, '/captions', { entries: lines(8, 'a') });
+    h.clock.t += 30000;
+    assert.equal((await h.app.runUpdate('test')).ok, true); // 偽 claude は「月額はいくらか」を done:false で返す
+    let st = (await get(h, '/state')).json;
+    assert.deepEqual(st.board.checklist.map((c) => [c.id, c.state, !!c.byUser]), [['q1', 'done', true], ['q2', 'open', false]], '人の「済」が claude の「まだ」に勝つ');
+    assert.equal(st.board.next_action.ref, 'q2');
+
+    // 整理のあとに直すと、すぐボードに出て保存される
+    assert.equal((await post(h, '/override', { id: 'q2', state: 'deferred', owner: '佐々木' })).status, 200);
+    st = (await get(h, '/state')).json;
+    assert.deepEqual([st.board.checklist[1].state, st.board.checklist[1].owner], ['deferred', '佐々木']);
+    assert.equal(st.board.next_action.text, '持ち帰りを読み上げて確かめる');
+    const dir = fs.readdirSync(h.dataDir).find((d) => /^\d{4}-/.test(d));
+    const saved = JSON.parse(fs.readFileSync(path.join(h.dataDir, dir, 'overrides.json'), 'utf8'));
+    assert.deepEqual(Object.keys(saved).sort(), ['q1', 'q2']);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(h.dataDir, dir, 'board.json'), 'utf8')).checklist[1].state, 'deferred');
+
+    // 次の整理: claude に「手で直した」印が渡り、結果でも直した状態のまま
+    await post(h, '/captions', { entries: lines(4, 'b') });
+    h.clock.t += 30000;
+    assert.equal((await h.app.runUpdate('test')).ok, true);
+    assert.match(h.calls()[1].stdin, /"id":"q1","state":"done","owner":"","evidence":"","by_user":true/);
+    st = (await get(h, '/state')).json;
+    assert.deepEqual(st.board.checklist.map((c) => c.state), ['done', 'deferred']);
+
+    // 整理に任せる（auto）で人の状態をやめる
+    assert.equal((await post(h, '/override', { id: 'q2', state: 'auto' })).status, 200);
+    assert.equal((await get(h, '/state')).json.board.checklist[1].byUser, undefined);
+
+    await post(h, '/reset');
+    assert.deepEqual(h.app.overrides, {}, '新しい会議では消える');
+  } finally {
+    await h.close();
+  }
+});
+
+test('差分の整理: 2 回目から「前回より後」と差分の形を頼み、重ねる。おかしな返事のあとと、決まった回数ごとは全体に戻す', async () => {
+  const h = await S.startApp({ fakeClock: true, mode: 'diff', notes: '## 今日聞くこと\n1. 月額はいくらか\n2. 納期はいつか' });
+  const f = (name, obj) => {
+    const p = path.join(h.dataDir, name);
+    fs.writeFileSync(p, typeof obj === 'string' ? obj : JSON.stringify(obj));
+    return p;
+  };
+  const full = f('full.json', { topics: [{ title: '費用', current: true, points: [{ speaker: '佐々木', text: '月額は400円' }] }], checklist: [{ id: 'q1', state: 'done', evidence: '400円' }] });
+  const patch = f('patch.json', { mode: 'patch', topics: [{ title: '納期', id: '', current: true, points: [{ speaker: '佐々木', text: '納期は3月' }] }], current_id: '', checklist: [{ id: 'q2', state: 'done', evidence: '3月' }], next_action: { text: '持ち帰りを確かめる', ref: '' }, warnings: [], status: '順調' });
+  const garbage = f('garbage.json', 'GARBAGE');
+  h.app.env.STUB_BOARDS = [full, patch, garbage, full, patch, full].join(',');
+  try {
+    const step = async (prefix) => {
+      await post(h, '/captions', { entries: lines(8, prefix).map((e, i) => Object.assign(e, { firstSeen: h.clock.t + i })) });
+      h.clock.t += 30000;
+      return h.app.runUpdate('test');
+    };
+    assert.equal((await step('a')).ok, true);
+    assert.equal((await step('b')).ok, true);
+    let calls = h.calls();
+    assert.ok(!calls[0].stdin.includes('## 出力（差分）'), '1 回目は全体');
+    assert.ok(calls[1].stdin.includes('## 出力（差分）'), '2 回目は差分');
+    assert.ok(calls[1].stdin.includes('【字幕の範囲】\n前回より後だけ'));
+    let st = (await get(h, '/state')).json;
+    assert.deepEqual(st.board.topics.map((t) => [t.title, t.current]), [['費用', false], ['納期', true]], '前回の話題を残し、差分の話題を足す');
+    assert.deepEqual(st.board.checklist.map((c) => c.state), ['done', 'done']);
+    assert.equal(st.status.update.lastMode, 'diff');
+
+    // おかしな差分の返事 → 前のボードを残し、次は全体
+    const bad = await step('c');
+    assert.equal(bad.ok, false);
+    assert.equal(h.app.forceFull, true);
+    h.clock.t += 60000;
+    assert.equal((await step('d')).ok, true);
+    calls = h.calls();
+    assert.ok(!calls[3].stdin.includes('## 出力（差分）'), 'おかしな差分のあとは全体');
+
+    // 差分を決まった回数（ここでは 1 回）続けたら、全体でまとめ直す
+    h.app.fullEvery = 1;
+    assert.equal((await step('e')).ok, true);
+    assert.equal((await step('f')).ok, true);
+    calls = h.calls();
+    assert.ok(calls[4].stdin.includes('## 出力（差分）'));
+    assert.ok(!calls[5].stdin.includes('## 出力（差分）'), 'まとめ直し');
+
+    const dir = fs.readdirSync(h.dataDir).find((d) => /^\d{4}-/.test(d));
+    const rows = fs.readFileSync(path.join(h.dataDir, dir, 'updates.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.deepEqual(rows.map((r) => [r.mode, r.ok]), [['full', true], ['diff', true], ['diff', false], ['full', true], ['diff', true], ['full', true]]);
+  } finally {
+    await h.close();
+  }
+});
+
+test('差分の整理: --mode full なら毎回全体', async () => {
+  const h = await S.startApp({ fakeClock: true });
+  h.app.mode = 'full';
+  try {
+    for (const p of ['a', 'b']) {
+      await post(h, '/captions', { entries: lines(8, p) });
+      h.clock.t += 30000;
+      assert.equal((await h.app.runUpdate('test')).ok, true);
+    }
+    assert.ok(h.calls().every((c) => !c.stdin.includes('## 出力（差分）')));
+  } finally {
+    await h.close();
+  }
+});
+
 test('整理: 2 回目は前回のボードを渡す。事前メモが無ければ聞くことの表とカードは空', async () => {
   const h = await S.startApp({ fakeClock: true });
   try {
@@ -360,6 +512,161 @@ test('整理: 使用上限は上限として知らせ、5 分は呼び直さな�
     h.app.env.STUB_MODE = 'ok';
     h.app.tick();
     await S.waitFor(() => h.app.updateCount === 1, 15000);
+  } finally {
+    await h.close();
+  }
+});
+
+test('整理: 長い発言が書き換わって行が減っても止まらない（0.1 の「内部エラー: reading \'text\'」で以後ずっと止まった件）', async () => {
+  const h = await S.startApp({ fakeClock: true });
+  try {
+    // 前半: 100 字 × 130 発言（1 万 3 千字。窓は「前回より後だけ」になる）、後半: 1 人の長い発言（600 字ごとに分かれて何行にもなる）
+    const many = [];
+    for (let i = 0; i < 130; i++) many.push(cap('m' + i, '佐々木', String(i).padStart(3, '0') + 'い'.repeat(97), { firstSeen: T0 + i * 1000 }));
+    const longText = 'これは長い発言の一文です。'.repeat(1000).slice(0, 12000);
+    await post(h, '/captions', { entries: many.concat([cap('long', '山田', longText, { firstSeen: T0 + 200000, lastUpdate: T0 + 200000 })]) });
+    h.clock.t += 30000;
+    assert.equal((await h.app.runUpdate('test')).ok, true);
+    const before = h.app.lastLineCount;
+    assert.ok(before > 140, '長い発言が何行にもなっている: ' + before);
+
+    // 同じ発言（同じ id）が短く書き換わった → 行の数が前回より減る
+    await post(h, '/captions', { entries: [cap('long', '山田', '言い直して短くなりました。', { firstSeen: T0 + 200000, lastUpdate: T0 + 300000 })] });
+    h.clock.t += 30000;
+    const r = await h.app.runUpdate('test');
+    assert.equal(r.ok, true, r.message);
+    assert.equal(h.app.inFlight, false);
+    assert.ok(h.app.lastLineCount < before);
+    assert.equal(h.app.updateCount, 2);
+    assert.match(h.calls()[1].stdin, /言い直して短くなりました。/);
+  } finally {
+    await h.close();
+  }
+});
+
+test('整理: 途中で例外が出ても「整理中」のまま固まらず、黒い画面に（本文を伏せて）出し、間をあけて次の回にやり直す', async () => {
+  const h = await S.startApp({ fakeClock: true });
+  const warned = [];
+  h.app.warn = (m) => warned.push(m);
+  try {
+    await post(h, '/captions', { entries: lines(8, 'a').concat([cap('s', '山田', SECRET)]) });
+    const realLines = h.app.transcript.lines.bind(h.app.transcript);
+    h.app.transcript.lines = () => {
+      throw new Error('試験の例外: ' + SECRET);
+    };
+    h.clock.t += 30000;
+    const r = await h.app.runUpdate('test');
+    assert.equal(r.ok, false);
+    assert.equal(r.kind, 'internal');
+    assert.equal(h.app.inFlight, false, '整理中のまま固まらない');
+    assert.equal(warned.length, 1);
+    assert.match(warned[0], /整理のエラー \[internal\]/);
+    assert.ok(!warned.join('\n').includes('ZQX9172'), '黒い画面に字幕の本文を出さない');
+
+    // 直したら、待ち時間のあとの tick で自動でやり直して更新される
+    h.app.transcript.lines = realLines;
+    h.clock.t += 1000;
+    h.app.tick();
+    await S.sleep(100);
+    assert.equal(h.calls().length, 0, '失敗の直後は呼ばない');
+    h.clock.t += 60000;
+    h.app.tick();
+    await S.waitFor(() => h.app.updateCount === 1, 15000);
+    assert.equal((await get(h, '/state')).json.status.lastError, null);
+  } finally {
+    await h.close();
+  }
+});
+
+test('整理: claude の返事の要素が欠けていても（text の無い要点・オブジェクトでない話題）落ちず、次の回も更新される', async () => {
+  const h = await S.startApp({ fakeClock: true, notes: '## 聞くこと\n- 月額はいくらか' });
+  const bad = path.join(h.dataDir, 'bad.json');
+  const good = path.join(h.dataDir, 'good.json');
+  fs.writeFileSync(bad, JSON.stringify({
+    topics: [null, 'ただの文字列', { title: '費用', current: true, points: [{ speaker: '佐々木' }, null, { text: '月額は400円です', speaker: '佐々木' }], todos: [{ who: '山田' }, null], decisions: [null, 1] }],
+    open_questions: [null, { q: 'x' }],
+    checklist: [null, { evidence: 'item が無い' }, { item: '月額はいくらか', done: 'はい' }],
+    cards: [null, {}],
+    next_action: 'ただの文字列',
+    warnings: [{ heard: '' }, null],
+  }));
+  fs.writeFileSync(good, JSON.stringify({ topics: [{ title: '費用の続き', current: true, points: [{ speaker: '佐々木', text: '初期費用は30万円です' }] }] }));
+  try {
+    await post(h, '/captions', { entries: lines(8, 'a') });
+    h.app.env.STUB_BOARD = bad;
+    h.clock.t += 30000;
+    const r1 = await h.app.runUpdate('test');
+    assert.equal(r1.ok, true, r1.message);
+    const t = r1.board.topics.find((x) => x.title === '費用');
+    assert.deepEqual(t.points.map((p) => p.text), ['月額は400円です'], 'text の無い要点は捨てる');
+
+    h.app.env.STUB_BOARD = good;
+    await post(h, '/captions', { entries: lines(8, 'b') });
+    h.clock.t += 30000;
+    const r2 = await h.app.runUpdate('test');
+    assert.equal(r2.ok, true, r2.message);
+    assert.equal(h.app.updateCount, 2, '次の回も更新される');
+    assert.ok(r2.board.topics.some((x) => x.title === '費用の続き'));
+  } finally {
+    await h.close();
+  }
+});
+
+test('整理: 話者が替わらない長い発言（final:false のまま）も整理に渡り、6 秒伸びなければ確定になる', async () => {
+  const h = await S.startApp({ fakeClock: true });
+  try {
+    const long = 'まだ話し続けています。' + 'これは長い独り語りの一部です。'.repeat(12);
+    await post(h, '/captions', { entries: [cap('solo', '山田', long, { final: false })] });
+    h.clock.t += 3000;
+    h.app.tick();
+    assert.equal((await get(h, '/state')).json.recent[0].final, false, '3 秒ではまだ確定にしない');
+    h.clock.t += 4000;
+    h.app.tick();
+    assert.equal((await get(h, '/state')).json.recent[0].final, true, '6 秒伸びなければ確定');
+
+    h.clock.t += 20000;
+    h.app.tick();
+    await S.waitFor(() => h.app.updateCount === 1, 15000);
+    assert.match(h.calls()[0].stdin, /山田：まだ話し続けています。/, '確定を待たずに整理へ渡る');
+
+    // 同じ長さのまま言い直された（字数は増えない）→ 間隔が来れば整理し直す
+    const revised = long.replace('まだ', 'いま');
+    assert.equal(revised.length, long.length);
+    await post(h, '/captions', { entries: [cap('solo', '山田', revised, { final: false, lastUpdate: T0 + 90000 })] });
+    assert.equal(h.app.pendingChars(), 0);
+    h.clock.t += 61000;
+    h.app.tick();
+    await S.waitFor(() => h.app.updateCount === 2, 15000);
+    assert.match(h.calls()[1].stdin, /山田：いま話し続けています。/);
+  } finally {
+    await h.close();
+  }
+});
+
+test('整理: claude の所要時間と費用（数字だけ）を状態・診断・updates.jsonl に残す（本文は入れない）', async () => {
+  const h = await S.startApp({ fakeClock: true, env: { STUB_COST_USD: '0.02' } });
+  try {
+    await post(h, '/captions', { entries: lines(8, 'a').concat([cap('s', '山田', SECRET)]) });
+    h.clock.t += 30000;
+    assert.equal((await h.app.runUpdate('test')).ok, true);
+    await post(h, '/captions', { entries: lines(4, 'b') });
+    h.clock.t += 30000;
+    assert.equal((await h.app.runUpdate('test')).ok, true);
+    const u = (await get(h, '/state')).json.status.update;
+    assert.equal(u.lastClaudeMs, 4321);
+    assert.equal(u.lastCostUsd, 0.02);
+    assert.equal(u.totalCostUsd, 0.04);
+    const diag = (await get(h, '/diag')).text;
+    assert.match(diag, /費用: 直近 \$0\.0200・この会議の合計 \$0\.0400/);
+    const dir = fs.readdirSync(h.dataDir).find((d) => /^\d{4}-/.test(d));
+    const rows = fs.readFileSync(path.join(h.dataDir, dir, 'updates.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.equal(rows.length, 2);
+    assert.deepEqual(Object.keys(rows[0]).sort(), ['at', 'claudeMs', 'costUsd', 'inChars', 'kind', 'mode', 'ms', 'ok', 'outChars', 'range', 'reason']);
+    assert.equal(rows[0].ok, true);
+    assert.equal(rows[0].costUsd, 0.02);
+    assert.ok(rows[0].inChars > 0 && rows[0].outChars > 0);
+    const raw = fs.readFileSync(path.join(h.dataDir, dir, 'updates.jsonl'), 'utf8');
+    assert.ok(!raw.includes('ZQX9172') && !raw.includes('山田'), '本文・名前は入れない');
   } finally {
     await h.close();
   }

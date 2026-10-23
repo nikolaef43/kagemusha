@@ -50,6 +50,46 @@ test('--once: 全部読み込んで整理を 1 回だけ行い、標準出力に
   }
 });
 
+test('--once --me: 使う人の名前と、事前メモの表・こちらの理解が claude に渡る。結果に次の一手と 3 状態の表がある', () => {
+  const dir = S.tmpDir();
+  const log = path.join(dir, 'calls.jsonl');
+  try {
+    const r = runCli(['--replay', SAMPLE_TX, '--notes', SAMPLE_NOTES, '--me', '山田', '--once', '--data-dir', dir, '--port', '0'], { STUB_LOG: log });
+    assert.equal(r.status, 0, r.stderr);
+    const board = JSON.parse(r.stdout);
+    assert.ok(board.next_action && board.next_action.text, '次の一手がある');
+    assert.ok(board.checklist.every((c) => ['done', 'deferred', 'open'].includes(c.state)));
+    assert.equal(board.checklist.length, 4, '事前メモの聞くこと 3 つと伝えること 1 つ');
+    const input = JSON.parse(fs.readFileSync(log, 'utf8').trim().split('\n')[0]).stdin;
+    assert.match(input, /【使う人】\n山田（/);
+    assert.match(input, /【こちらの理解】\na1（前回の決定）: 切り替えは来年の4月1日に行う。\na2（こちらの理解）: 解約の連絡は1か月前で足りる。/);
+    assert.match(input, /\[\d\d:\d\d\] 山田：もしもし/, '字幕の名前はそのまま');
+  } finally {
+    S.rmDir(dir);
+  }
+});
+
+test('--once --mode diff: 前 6 割で全体 → 残りで差分の 2 回。--mode なしの --once は全体 1 回のまま', () => {
+  const dir = S.tmpDir();
+  const log = path.join(dir, 'calls.jsonl');
+  try {
+    const r = runCli(['--replay', SAMPLE_TX, '--notes', SAMPLE_NOTES, '--mode', 'diff', '--once', '--data-dir', dir, '--port', '0'], { STUB_LOG: log });
+    assert.equal(r.status, 0, r.stderr);
+    JSON.parse(r.stdout);
+    const calls = fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].stdin.split('【字幕】\n')[1].trim().split('\n').length, 35, '58 行の 6 割');
+    assert.ok(calls[1].stdin.includes('## 出力（差分）'));
+    assert.match(calls[1].stdin, /佐々木：お疲れさまでした。/);
+    assert.match(r.stderr, /残りの 23 行で、差分の整理を頼みます/);
+    const sessions = fs.readdirSync(dir).filter((d) => /^\d{4}-/.test(d));
+    const rows = fs.readFileSync(path.join(dir, sessions[0], 'updates.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.deepEqual(rows.map((x) => x.mode), ['full', 'diff']);
+  } finally {
+    S.rmDir(dir);
+  }
+});
+
 test('--once: 整理に失敗したら標準出力は空、終了コード 1、理由は標準エラーに日本語で', () => {
   const dir = S.tmpDir();
   try {
@@ -76,7 +116,9 @@ test('--once は --replay が無ければ使えない。--help は使い方を�
 
 /** 通常起動のヘルパーを子プロセスで立てる。バナーからボードの URL（ポート）を読む */
 function startServer(args, env) {
-  const child = spawn(process.execPath, [SERVER].concat(args), { env: S.stubEnv(env), stdio: ['ignore', 'pipe', 'pipe'] });
+  // IPC つきで起動し、止めるときは {type:'stop'} を送る（Windows の Node は子への SIGTERM を強制終了にし、
+  // 終了コードが null になるため。どの OS でも同じ「きれいな終了」の道を通す）
+  const child = spawn(process.execPath, [SERVER].concat(args), { env: S.stubEnv(env), stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
   let out = '';
   let err = '';
   child.stdout.setEncoding('utf8');
@@ -98,7 +140,8 @@ function startServer(args, env) {
       return Number(m[1]);
     },
     stop: async () => {
-      child.kill('SIGTERM');
+      if (child.connected) child.send({ type: 'stop' });
+      else child.kill('SIGTERM');
       return Promise.race([exited, S.sleep(8000).then(() => 'timeout')]);
     },
   };
@@ -134,7 +177,20 @@ test('--replay（通常起動）: 会話を流し、最後に 1 回整理して�
     assert.match(page.text, /ここまでの話/);
   } finally {
     const code = await srv.stop();
-    assert.equal(code, 0, 'Ctrl+C（SIGTERM）できれいに終わる: ' + srv.err());
+    assert.equal(code, 0, '止める合図できれいに終わる（終了コード 0）: ' + srv.err());
+    S.rmDir(dir);
+  }
+});
+
+test('SIGTERM: POSIX ではきれいに終わる（0）。Windows の Node は子への SIGTERM が強制終了なので null', async () => {
+  const dir = S.tmpDir();
+  const srv = startServer(['--port', '0', '--data-dir', dir], {});
+  try {
+    await srv.port();
+    srv.child.kill('SIGTERM');
+    const code = await Promise.race([srv.exited, S.sleep(8000).then(() => 'timeout')]);
+    assert.equal(code, process.platform === 'win32' ? null : 0);
+  } finally {
     S.rmDir(dir);
   }
 });

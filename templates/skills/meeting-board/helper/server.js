@@ -4,7 +4,9 @@
 // ボード（http://127.0.0.1:47431/）に出す。127.0.0.1 だけで待ち受け、外には何も送らない。
 //
 //   node helper/server.js [--port 47431] [--interval 60] [--model sonnet] [--open]
-//                         [--notes ファイル] [--replay ファイル [--speed 10]] [--once] [--data-dir フォルダ]
+//                         [--notes ファイル] [--replay ファイル [--speed auto]] [--once] [--data-dir フォルダ] [--me 名前]
+//                         [--mode diff|full]
+//   node helper/server.js --minutes <会議フォルダ | board.json> [--out ファイル]   議事録の素（Markdown）を書き出す
 
 // 古い Node でも、ここまでは読めるように古い構文だけで書いてある（18 未満なら理由を出して終わる）
 const nodeMajor = Number(String(process.versions.node).split('.')[0]);
@@ -20,9 +22,11 @@ const { spawn } = require('child_process');
 const { parseArgs, USAGE } = require('./lib/args');
 const { MeetingBoardApp } = require('./lib/app');
 const { listen, probeExisting } = require('./lib/httpserver');
-const { parseReplayText, toEntries, startReplay } = require('./lib/replay');
+const { toEntries, startReplay, autoSpeed, replaySeconds } = require('./lib/replay');
+const { importTranscript } = require('./lib/importers');
+const { boardToMarkdown, transcriptInfo } = require('./lib/minutes');
 
-const VERSION = '0.1.0';
+const VERSION = '0.3.0';
 const HELPER_DIR = __dirname;
 
 // 会議の最中に落ちないように、想定外のエラーは表示だけして続ける
@@ -62,6 +66,54 @@ function formatCheck(c) {
   return '  ' + (c.ok ? 'OK ' : 'NG ') + c.name + ': ' + c.detail;
 }
 
+/**
+ * --minutes: 保存したボードから議事録の素（Markdown）を書き出す。この PC の中だけ（標準出力かファイル）。
+ * 場所が会議フォルダなら board.json と transcript.jsonl（日時と名前だけ使う）を読む。JSON ファイルならそれを読む
+ */
+function exportMinutes(opts) {
+  const target = path.resolve(opts.minutes);
+  let boardFile = target;
+  let txFile = null;
+  try {
+    if (fs.statSync(target).isDirectory()) {
+      boardFile = path.join(target, 'board.json');
+      txFile = path.join(target, 'transcript.jsonl');
+    }
+  } catch (e) {
+    console.error('--minutes の場所が見つかりません: ' + opts.minutes);
+    return 2;
+  }
+  let board;
+  try {
+    board = JSON.parse(fs.readFileSync(boardFile, 'utf8'));
+  } catch (e) {
+    console.error('ボード（board.json）を読めませんでした: ' + boardFile + '（' + e.message + '）');
+    return 2;
+  }
+  if (!board || !Array.isArray(board.topics)) {
+    console.error('ボードの形ではありません（topics がありません）: ' + boardFile);
+    return 2;
+  }
+  let info = {};
+  if (txFile && fs.existsSync(txFile)) {
+    let selfName = '';
+    try {
+      selfName = JSON.parse(fs.readFileSync(path.join(path.dirname(target), 'settings.json'), 'utf8')).selfName || '';
+    } catch (_) {
+      /* 無くてよい */
+    }
+    info = transcriptInfo(fs.readFileSync(txFile, 'utf8'), selfName || opts.me || '');
+  }
+  const md = boardToMarkdown(board, info);
+  if (opts.out) {
+    fs.writeFileSync(path.resolve(opts.out), md, 'utf8');
+    console.error('議事録の素を書き出しました: ' + path.resolve(opts.out) + '（下書きです。外に出す前に見直してください）');
+  } else {
+    process.stdout.write(md);
+  }
+  return 0;
+}
+
 async function main() {
   const parsed = parseArgs(process.argv.slice(2));
   if (parsed.opts.help) {
@@ -74,6 +126,7 @@ async function main() {
     return 2;
   }
   const opts = parsed.opts;
+  if (opts.minutes) return exportMinutes(opts);
   // --once は結果の JSON だけを標準出力に出す。案内やログは標準エラーへ
   const say = opts.once ? function (m) { console.error(m); } : function (m) { console.log(m); };
 
@@ -89,16 +142,20 @@ async function main() {
   }
   let replayLines = null;
   if (opts.replay) {
+    let imported;
     try {
-      replayLines = parseReplayText(fs.readFileSync(path.resolve(opts.replay), 'utf8'));
+      imported = importTranscript(fs.readFileSync(path.resolve(opts.replay), 'utf8'), opts.replay);
     } catch (e) {
       console.error('--replay のファイルを読めませんでした（' + opts.replay + '）: ' + e.message);
       return 2;
     }
-    if (replayLines.length === 0) {
-      console.error('--replay のファイルに「話者：本文」の行がありません: ' + opts.replay);
+    if (imported.format === 'unknown' || imported.lines.length === 0) {
+      console.error('--replay のファイルを読めませんでした: ' + opts.replay);
+      console.error('  ' + imported.note);
       return 2;
     }
+    replayLines = imported.lines;
+    say('--replay: ' + imported.note);
   }
 
   const app = new MeetingBoardApp({
@@ -110,8 +167,16 @@ async function main() {
     promptPath: path.join(HELPER_DIR, 'prompt.md'),
     boardHtmlPath: path.join(HELPER_DIR, 'board.html'),
     notes: notes,
+    me: opts.me,
+    mode: opts.mode,
     log: function (m) {
       if (process.env.MEETING_BOARD_DEBUG) console.error('[debug] ' + m);
+    },
+    // 整理のエラーは黒い画面にも出す（--once では標準エラー）。字幕の本文と名前は伏せてある
+    warn: function (m) {
+      const d = new Date();
+      const t = [d.getHours(), d.getMinutes(), d.getSeconds()].map(function (n) { return String(n).padStart(2, '0'); }).join(':');
+      say(t + ' ' + m);
     },
   });
 
@@ -120,9 +185,17 @@ async function main() {
     await app.runSelfCheck({ listenInfo: null, withVersion: false });
     for (const c of app.selfCheck) say(formatCheck(c));
     const base = Date.now();
-    for (const e of toEntries(replayLines, base)) app.transcript.upsert(e, Date.now());
+    const all = toEntries(replayLines, base);
+    // --mode diff: 前 6 割で全体の整理 → 残りで差分の整理（差分の速さと形を 1 回で確かめるため）
+    const split = opts.mode === 'diff' && all.length >= 4 ? Math.ceil(all.length * 0.6) : all.length;
+    for (const e of all.slice(0, split)) app.transcript.upsert(e, Date.now());
     say('字幕 ' + app.transcript.entries.length + ' 行を読み込みました。claude に整理を頼みます（しばらくかかります）...');
-    const r = await app.runUpdate('once');
+    let r = await app.runUpdate('once');
+    if (r.ok && split < all.length) {
+      for (const e of all.slice(split)) app.transcript.upsert(e, Date.now());
+      say('残りの ' + (all.length - split) + ' 行で、差分の整理を頼みます...');
+      r = await app.runUpdate('once-diff');
+    }
     app.shutdown();
     if (!r.ok) {
       console.error('整理に失敗しました: ' + r.message);
@@ -191,8 +264,15 @@ async function main() {
   if (replayLines) {
     const entries = toEntries(replayLines, Date.now());
     app.replay = { active: true, index: 0, total: entries.length };
-    say('--replay: ' + entries.length + ' 行を ' + opts.speed + ' 倍速で流します。');
-    replayHandle = startReplay(entries, opts.speed, function (entry, i) {
+    const realSec = replaySeconds(replayLines);
+    const speed = opts.speed === 'auto' ? autoSpeed({ realSec, intervalSec: opts.interval }) : opts.speed;
+    const playMin = Math.max(1, Math.round(realSec / speed / 60));
+    const cycles = Math.max(1, Math.round(realSec / speed / (Math.min(opts.interval, 20) + 45)));
+    say(
+      '--replay: ' + entries.length + ' 行を ' + speed + ' 倍速で流します（約 ' + playMin + ' 分・整理はおよそ ' + cycles + ' 回の見込み' +
+        (opts.speed === 'auto' ? '。速さは --speed で変えられます' : '') + '）。'
+    );
+    replayHandle = startReplay(entries, speed, function (entry, i) {
       app.transcript.upsert(entry, Date.now());
       app.replay = { active: true, index: i + 1, total: entries.length };
     });
@@ -218,6 +298,15 @@ async function main() {
     };
     process.on('SIGINT', stop);
     process.on('SIGTERM', stop);
+    if (process.platform === 'win32') process.on('SIGBREAK', stop); // Ctrl+Break
+    // 試験などで IPC つきで起動されたときは {type:'stop'} の合図でも同じ道で終わる。
+    // Windows の Node は子への SIGTERM を強制終了にする（ハンドラが走らない）ため、どの OS でも
+    // 同じ「きれいな終了」を通せるようにしてある。通常の起動（start.cmd）では IPC が無いので何も起きない
+    if (typeof process.send === 'function') {
+      process.on('message', function (m) {
+        if (m && m.type === 'stop') stop();
+      });
+    }
   });
   return 0;
 }
