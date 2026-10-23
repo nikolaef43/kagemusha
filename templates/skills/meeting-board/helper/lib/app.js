@@ -11,11 +11,12 @@ const fs = require('fs');
 const os = require('os');
 
 const { Store } = require('./store');
-const { Transcript } = require('./transcript');
+const { Transcript, SELF_TOKEN } = require('./transcript');
 const { buildWindow, buildWindowDiff, buildPrompt, shouldUpdate } = require('./prompt');
 const { extractJsonObject } = require('./extract');
 const { normalizeBoardV2, toPromptBoard, applyOverrides, mergePatch, detailTopicIds } = require('./board');
 const { parseNotes } = require('./notes');
+const { parseScript, locate, findClosingLine } = require('./script');
 const { resolveClaude, callClaude, claudeVersion } = require('./claude');
 const { buildDiagText } = require('./diag');
 const { errMsg, clip, shortenHome } = require('./util');
@@ -39,15 +40,25 @@ class MeetingBoardApp {
     this.warn = o.warn || (() => {});
     this.env = o.env || process.env;
     this.promptMd = fs.readFileSync(o.promptPath, 'utf8');
-    // 差分の整理（2 回目から「変わったところだけ」を返してもらう）。'full' なら毎回全体
-    this.mode = o.mode === 'diff' ? 'diff' : 'full';
-    const patchPath = o.patchPromptPath || require('path').join(require('path').dirname(o.promptPath), 'prompt_patch.md');
-    this.patchMd = this.mode === 'diff' ? fs.readFileSync(patchPath, 'utf8') : '';
-    this.fullEvery = o.fullEvery || 8; // 差分をこの回数続けたら、1 回は全体でまとめ直す
-    this.fullEveryMs = o.fullEveryMs || 600000; // または前の全体から 10 分たったら
-    this.minGapMs = this.mode === 'diff' ? o.minGapMs || 8000 : 0; // 前倒しの整理の最短の間
+    // 整理の仕方。'full' … 毎回全体／'diff' … 2 回目から「変わったところだけ」／
+    // 'live' … 2 回目から会議中の画面の分だけ（話題は書かせない）。話題は数分おきと、字幕が止まったときに全体でまとめ直す。
+    // 毎回全体を書き直させると、返事が長くなるほど 1 回が遅くなる（2026-10-23 の会議で 8 秒 → 20〜40 秒）
+    this.mode = o.mode === 'diff' || o.mode === 'live' ? o.mode : 'full';
+    const dir = require('path').dirname(o.promptPath);
+    const patchPath = o.patchPromptPath || require('path').join(dir, 'prompt_patch.md');
+    const livePath = o.livePromptPath || require('path').join(dir, 'prompt_live.md');
+    this.patchMd = this.mode === 'diff' ? fs.readFileSync(patchPath, 'utf8') : this.mode === 'live' ? fs.readFileSync(livePath, 'utf8') : '';
+    this.fullEvery = o.fullEvery || (this.mode === 'live' ? 1000 : 8); // 差分をこの回数続けたら、1 回は全体でまとめ直す
+    this.fullEveryMs = o.fullEveryMs || (this.mode === 'live' ? 300000 : 600000); // または前の全体から 10 分（live は 5 分）たったら
+    this.liveIdleMs = o.liveIdleMs || 45000; // live: 字幕がこれだけ止まったら、話題を全体でまとめ直す（会議の終わり）
+    this.minGapMs = this.mode !== 'full' ? o.minGapMs || 8000 : 0; // 前倒しの整理の最短の間
     this.boardHtmlPath = o.boardHtmlPath;
     this.boardCorePath = o.boardCorePath || null;
+    // 台本（--script）。claude には渡さない。いまの位置は字幕から規則で当てる
+    this.scriptSections = o.script ? parseScript(o.script) : null;
+    this.scriptManual = !!o.scriptManual; // 台本の位置は人が押したときだけ動かす
+    this.scriptPos = null;
+    this.closingLine = this.scriptSections ? findClosingLine(this.scriptSections) : null; // 最後に確かめる文（穴あき）
     this.me = o.me ? String(o.me).replace(/\s+/g, ' ').trim().slice(0, MAX_NAME_LEN) : ''; // --me（字幕に出る自分の名前）
 
     this.store = new Store(o.dataDir);
@@ -250,6 +261,7 @@ class MeetingBoardApp {
     try {
       const now = this.now();
       this.transcript.settle(now);
+      this.updateScriptPos();
       this.persist(false);
       let reason = shouldUpdate({
         inFlight: this.inFlight,
@@ -263,6 +275,19 @@ class MeetingBoardApp {
         speakerTurns: this.transcript.speakerTurnsSince(this.lastEntryCount),
         minGapMs: this.board ? this.minGapMs : 0,
       });
+      // live: 字幕が止まったら（会議の終わり）、短い版のままの話題を全体でまとめ直す
+      if (
+        !reason &&
+        this.mode === 'live' &&
+        this.lastMode === 'live' &&
+        !this.inFlight &&
+        now >= this.blockedUntil &&
+        now - this.lastEndAt >= 5000 &&
+        this.transcript.lastCaptionAt > 0 &&
+        now - this.transcript.lastCaptionAt >= this.liveIdleMs
+      ) {
+        reason = 'flush';
+      }
       // --replay が流し終わったあとは、間隔を待たずに最後の整理を行う
       if (
         !reason &&
@@ -311,7 +336,7 @@ class MeetingBoardApp {
     let snapshotEntries = this.lastEntryCount;
     // 差分にするか: 2 回目から。全体に戻すのは、まとめ直しの時期・再生の終わり・--once・事前メモが変わった・前の差分がおかしかったとき
     const useDiff =
-      this.mode === 'diff' &&
+      this.mode !== 'full' &&
       !!this.board &&
       !this.forceFull &&
       ['once', 'flush', 'notes'].indexOf(reason) < 0 &&
@@ -335,7 +360,11 @@ class MeetingBoardApp {
       const win = useDiff ? buildWindowDiff(lines, this.lastLineCount) : buildWindow(lines, this.lastLineCount);
       let prevBoard = null;
       if (this.board) {
-        if (useDiff) {
+        if (useDiff && this.mode === 'live') {
+          // 短い版: 話題は見出しだけ渡し、中身は返させない（ヘルパーが前回のまま残す）
+          for (const t of this.board.topics) compactIds.add(t.id);
+          prevBoard = toPromptBoard(this.board, { detailIds: new Set() });
+        } else if (useDiff) {
           const detail = detailTopicIds(this.board);
           for (const t of this.board.topics) if (!detail.has(t.id)) compactIds.add(t.id);
           prevBoard = toPromptBoard(this.board, { detailIds: detail });
@@ -349,6 +378,7 @@ class MeetingBoardApp {
         lines: win.lines,
         users: this.usersLine(),
         spec: hasNotes ? this.notesSpec() : null,
+        closing: this.closingLine ? this.closingLine.text : null,
       });
       inChars = prompt.length;
       range = win.range;
@@ -393,7 +423,7 @@ class MeetingBoardApp {
           range,
           inChars,
           outChars,
-          mode: useDiff ? 'diff' : 'full',
+          mode: useDiff ? this.mode : 'full',
           ms: this.lastDurationMs,
           claudeMs,
           costUsd,
@@ -427,7 +457,7 @@ class MeetingBoardApp {
     this.lastTotalChars = snapshotChars;
     this.lastTextRevision = snapshotTextRev;
     this.lastEntryCount = snapshotEntries;
-    this.lastMode = useDiff ? 'diff' : 'full';
+    this.lastMode = useDiff ? this.mode : 'full';
     if (useDiff) this.diffsSinceFull += 1;
     else {
       this.diffsSinceFull = 0;
@@ -466,7 +496,7 @@ class MeetingBoardApp {
         };
       }
     }
-    const norm = normalizeBoardV2(raw, { hasNotes, spec: this.notesSpec(), prev: this.board, users: this.userNames(), now: this.now() });
+    const norm = normalizeBoardV2(raw, { hasNotes, spec: this.notesSpec(), prev: this.board, users: this.userNames(), now: this.now(), closing: !!this.closingLine });
     if (!norm.ok) {
       return {
         ok: false,
@@ -516,7 +546,7 @@ class MeetingBoardApp {
   stateJson() {
     const now = this.now();
     const sec = (t) => (t ? Math.max(0, Math.round((now - t) / 1000)) : null);
-    return {
+    const out = {
       status: {
         version: this.version,
         now,
@@ -559,6 +589,9 @@ class MeetingBoardApp {
       notesPresent: !!this.notes.trim(),
       selfName: this.settings.selfName || '',
     };
+    // 台本は --script のときだけ（診断には入れない）
+    if (this.scriptSections) out.script = { sections: this.scriptSections, pos: this.scriptPos || this.updateScriptPos(), closing: this.closingLine };
+    return out;
   }
 
   /** 字幕・名前・会議コードを含めない診断テキスト */
@@ -667,6 +700,43 @@ class MeetingBoardApp {
     if (listenInfo) checks.push(listenInfo);
     this.selfCheck = checks;
     return checks;
+  }
+
+  /** 台本のいまの位置を、直近の字幕から当て直す（tick ごと・claude は使わない） */
+  updateScriptPos() {
+    if (!this.scriptSections) return null;
+    if (this.scriptManual) return this.scriptPos || (this.scriptPos = { sectionIndex: 0, lineIndex: -1, by: 'manual', score: 1 });
+    const entries = this.transcript.entries;
+    const first = entries.length ? entries[0].firstSeen : 0;
+    const elapsed = first ? Math.max(0, (this.now() - first) / 1000) : null;
+    let recent = this.transcript.recent(40, this.selfName());
+    if (this.scriptPin) {
+      // 人が位置を決めたあとは、そのあとに増えた字幕だけで位置を当てる（決めた位置へ前の字幕で引き戻さない）
+      const pin = this.scriptPin;
+      recent = entries
+        .slice(-40)
+        .map((e) => {
+          const before = pin.has(e.id) ? pin.get(e.id) : 0;
+          const text = String(e.text || '').slice(before);
+          return { speaker: e.speaker === SELF_TOKEN ? this.selfName() : e.speaker || '不明', text, at: e.lastUpdate || e.firstSeen };
+        })
+        .filter((c) => c.text.trim().length >= 4);
+      if (!recent.length) return this.scriptPos;
+    }
+    this.scriptPos = locate(this.scriptSections, recent, elapsed, this.scriptPos, { me: this.me || this.selfName() });
+    return this.scriptPos;
+  }
+
+  /** 人が台本の位置を決める（台詞・節を押したとき）。lineIndex が -1 なら節の頭 */
+  setScriptPos(sectionIndex, lineIndex) {
+    const secs = this.scriptSections;
+    const si = Number(sectionIndex);
+    const li = lineIndex === undefined || lineIndex === null ? -1 : Number(lineIndex);
+    if (!secs || !Number.isInteger(si) || si < 0 || si >= secs.length) return { ok: false, status: 400, error: '節の番号が台本にありません' };
+    if (!Number.isInteger(li) || li < -1 || li >= secs[si].lines.length) return { ok: false, status: 400, error: '台詞の番号が台本にありません' };
+    this.scriptPin = new Map(this.transcript.entries.map((e) => [e.id, String(e.text || '').length]));
+    this.scriptPos = { sectionIndex: si, lineIndex: li, by: 'manual', score: 1 };
+    return { ok: true };
   }
 
   startLoop() {

@@ -5,7 +5,7 @@
 //
 //   node helper/server.js [--port 47431] [--interval 60] [--model sonnet] [--open]
 //                         [--notes ファイル] [--replay ファイル [--speed auto]] [--once] [--data-dir フォルダ] [--me 名前]
-//                         [--mode diff|full]
+//                         [--mode live|full|diff]
 //   node helper/server.js --minutes <会議フォルダ | board.json> [--out ファイル]   議事録の素（Markdown）を書き出す
 
 // 古い Node でも、ここまでは読めるように古い構文だけで書いてある（18 未満なら理由を出して終わる）
@@ -140,6 +140,15 @@ async function main() {
       return 2;
     }
   }
+  let scriptText = '';
+  if (opts.script) {
+    try {
+      scriptText = fs.readFileSync(path.resolve(opts.script), 'utf8');
+    } catch (e) {
+      console.error('台本を読めませんでした（' + opts.script + '）: ' + e.message);
+      return 2;
+    }
+  }
   let replayLines = null;
   if (opts.replay) {
     let imported;
@@ -168,7 +177,9 @@ async function main() {
     boardHtmlPath: path.join(HELPER_DIR, 'board.html'),
     notes: notes,
     me: opts.me,
-    mode: opts.mode,
+    script: scriptText,
+    scriptManual: opts.scriptManual,
+    mode: opts.mode || 'live',
     log: function (m) {
       if (process.env.MEETING_BOARD_DEBUG) console.error('[debug] ' + m);
     },

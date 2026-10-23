@@ -165,6 +165,28 @@ main { max-width: 980px; margin: 0 auto; padding: 12px 16px; }
 #itemList li.open .mark { color: var(--warn); }
 #itemList li.open .st { background: var(--warn-soft); color: var(--warn); }
 #itemList .nx { flex: none; font-size: 0.78em; font-weight: 700; color: var(--accent); }
+/* 台本（--script のときだけ）。高さは固定・中だけスクロール */
+#zScript { background: var(--panel); border: 1px solid var(--line); box-shadow: var(--shadow); }
+#zScript .zhead .btn { margin-left: auto; }
+#scriptTitle { font-weight: 700; margin-top: 4px; }
+#scriptBox { height: 420px; overflow-y: auto; margin-top: 6px; border-top: 1px solid var(--line); padding-top: 4px; overscroll-behavior: contain; }
+#scriptBox ol { list-style: none; margin: 0; padding: 0; }
+#scriptBox li { padding: 6px 10px; font-size: 1.35em; line-height: 1.6; border-radius: 6px; overflow-wrap: anywhere; }
+#scriptBox li.say { font-weight: 600; }
+#scriptBox li.note { color: var(--muted); font-size: 1.2em; padding-left: 1.6em; }
+#scriptBox li.past { opacity: 0.45; }
+#scriptBox li.current { background: var(--accent); color: #fff; }
+@media (prefers-color-scheme: dark) { #scriptBox li.current { color: #0b1020; } }
+#scriptBox li.next { border-left: 4px solid var(--accent); background: var(--accent-soft); }
+#scriptBox li.sec { font-weight: 700; color: var(--muted); padding-top: 6px; }
+#scriptBox li.sec.cur { color: var(--accent); }
+#closingBox { margin-top: 8px; border: 2px solid var(--accent); border-radius: 10px; padding: 6px 10px; background: var(--accent-soft); min-height: 112px; }
+#closing1 { font-size: 1.12em; font-weight: 700; overflow-wrap: anywhere; }
+#closingRest div { font-size: 0.88em; color: var(--muted); overflow-wrap: anywhere; margin-top: 2px; }
+#closingRest b { margin-right: 4px; }
+#capNow { height: 150px; overflow-y: auto; margin-top: 8px; border: 1px dashed var(--line); border-radius: 8px; padding: 4px 8px; font-size: 0.9em; }
+#capNow div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#capNow b { color: var(--muted); margin-right: 6px; }
 #itemList li[data-id] { cursor: pointer; }
 #itemList li[data-id]:hover { background: var(--accent-soft); }
 .byuser { flex: none; font-size: 0.75em; color: var(--muted); }
@@ -176,6 +198,22 @@ main { max-width: 980px; margin: 0 auto; padding: 12px 16px; }
 
 #meeting.stale .zone { opacity: 0.45; }
 #meeting.stale #staleNote { opacity: 1; }
+/* 台本があるときは左右に分ける: 左＝台本・最後に確かめる文・いまの字幕／右＝次の一手・順調か警告・伝え済み */
+@media (min-width: 900px) {
+  main#meeting:has(#zScript:not([hidden])) {
+    max-width: 1500px;
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+    grid-template-rows: auto auto auto auto 1fr; /* 右の 3 つは詰めて上に置き、台本の高さの余りは最後の行が受ける */
+    column-gap: 16px;
+    align-items: start;
+  }
+  main#meeting:has(#zScript:not([hidden])) > #staleNote { grid-column: 1 / -1; }
+  main#meeting:has(#zScript:not([hidden])) > #zScript { grid-column: 1; grid-row: 2 / span 4; }
+  main#meeting:has(#zScript:not([hidden])) > #zNext { grid-column: 2; grid-row: 2; }
+  main#meeting:has(#zScript:not([hidden])) > #zSignal { grid-column: 2; grid-row: 3; }
+  main#meeting:has(#zScript:not([hidden])) > #zList { grid-column: 2; grid-row: 4; }
+}
 #staleNote {
   display: block;
   text-align: center;
@@ -333,6 +371,19 @@ dialog textarea { min-height: 220px; resize: vertical; }
 
 <main id="meeting">
   <span id="staleNote" aria-live="polite"></span>
+  <section class="zone" id="zScript" hidden aria-labelledby="lbScript">
+    <div class="zhead"><span class="zlabel" id="lbScript">台本</span><span class="aside" id="scriptBy"></span><button class="btn" id="btnScriptAll" type="button">全体</button></div>
+    <p class="help">いまの台詞が青、次に言う台詞に線。言った字幕から位置を当てます（当たらないときは経過時間で節を選びます）。</p>
+    <div id="scriptTitle"></div>
+    <div id="scriptBox"><ol id="scriptList"></ol></div>
+    <div id="closingBox" hidden>
+      <div class="zhead"><span class="zlabel">最後に確かめる文</span><span class="aside" id="closingWhy"></span></div>
+      <div id="closing1"></div>
+      <div id="closingRest"></div>
+    </div>
+    <div class="zlabel" style="margin-top:8px">いまの字幕</div>
+    <div id="capNow"></div>
+  </section>
   <section class="zone" id="zNext" aria-labelledby="lbNext">
     <div class="zhead"><span class="zlabel" id="lbNext">次の一手</span></div>
     <p class="help" id="hpNext"></p>
@@ -558,6 +609,88 @@ dialog textarea { min-height: 220px; resize: vertical; }
 
   // ── 会議中 ───────────────────────────────────────────────
   var lastItemsKey = null;
+  // ── 台本（--script のときだけ） ───────────────────────────
+  var scriptAll = false;
+  var lastScriptKey = null;
+  $('btnScriptAll').addEventListener('click', function () {
+    scriptAll = !scriptAll;
+    $('btnScriptAll').textContent = scriptAll ? 'いまの節' : '全体';
+    lastScriptKey = null;
+    if (lastState) renderScript(lastState);
+  });
+  function renderScript(state) {
+    var v = V.scriptView(state);
+    $('zScript').hidden = !v;
+    if (!v) return;
+    var key = JSON.stringify([v, scriptAll]);
+    if (key === lastScriptKey) return;
+    var moved = !lastScriptKey || JSON.parse(lastScriptKey)[0].sectionIndex !== v.sectionIndex || JSON.stringify(JSON.parse(lastScriptKey)[0].lines.map(function (l) { return l.status; })) !== JSON.stringify(v.lines.map(function (l) { return l.status; }));
+    lastScriptKey = key;
+    setText($('scriptTitle'), (v.start ? v.start + '〜 ' : '') + v.title + '（' + (v.sectionIndex + 1) + '/' + v.total + '）');
+    setText($('scriptBy'), v.by === 'match' ? '字幕から' : v.by === 'time' ? '経過時間から' : v.by === 'manual' ? '手で決めた位置' : '');
+    var ol = $('scriptList');
+    clear(ol);
+    // 押した台詞・節を「いまの位置」にする（字幕の当て方がずれたときに人が直す）
+    function pick(si, li) {
+      api('POST', '/script-pos', { sectionIndex: si, lineIndex: li }).then(function (r) {
+        if (!r.ok) throw new Error(String(r.status));
+        lastScriptKey = null;
+        return poll && poll();
+      }).catch(function () { toast('台本の位置を変えられませんでした'); });
+    }
+    function lineLi(l, i) {
+      var li = el('li', l.kind + ' ' + l.status, l.text);
+      li.title = '押すと、ここをいまの位置にします';
+      li.style.cursor = 'pointer';
+      li.addEventListener('click', function () { pick(v.sectionIndex, i); });
+      return li;
+    }
+    if (scriptAll) {
+      v.all.forEach(function (sec, si) {
+        var h = el('li', 'sec' + (sec.current ? ' cur' : ''), (sec.start ? sec.start + '〜 ' : '') + sec.title);
+        h.title = '押すと、この節の頭をいまの位置にします';
+        h.style.cursor = 'pointer';
+        h.addEventListener('click', function () { pick(si, -1); });
+        ol.appendChild(h);
+        if (sec.current) v.lines.forEach(function (l, i) { ol.appendChild(lineLi(l, i)); });
+      });
+    } else {
+      v.lines.forEach(function (l, i) { ol.appendChild(lineLi(l, i)); });
+    }
+    // ページは動かさず、台本の枠の中だけを動かして、いまの台詞（無ければ次の台詞）を見える位置に
+    if (moved) {
+      var box = $('scriptBox');
+      var target = ol.querySelector('li.current') || ol.querySelector('li.next') || ol.querySelector('li.sec.cur');
+      if (target) box.scrollTop = Math.max(0, target.offsetTop - ol.offsetTop - box.clientHeight / 3);
+      else box.scrollTop = 0;
+    }
+    var cb = $('closingBox');
+    cb.hidden = !v.closing;
+    if (v.closing) {
+      var c1 = v.closing.candidates[0];
+      setText($('closing1'), c1 ? '第1：' + c1.text : v.closing.template);
+      setText($('closingWhy'), c1 ? (c1.why ? '（' + c1.why + '）' : '') : '（まだ埋まっていません）');
+      var rest = $('closingRest');
+      clear(rest);
+      v.closing.candidates.slice(1).forEach(function (c, i) {
+        var d = el('div');
+        d.appendChild(el('b', null, i === 0 ? '第2' : '第3'));
+        d.appendChild(document.createTextNode(c.text + (c.why ? '（' + c.why + '）' : '')));
+        rest.appendChild(d);
+      });
+    }
+    var cap = $('capNow');
+    clear(cap);
+    if (!v.captions.length) cap.appendChild(el('div', 'dim', 'まだ字幕が届いていません'));
+    v.captions.forEach(function (c) {
+      var d = el('div');
+      d.appendChild(el('b', null, c.speaker));
+      d.appendChild(document.createTextNode(c.text));
+      d.title = c.text;
+      cap.appendChild(d);
+    });
+  }
+
   function renderMeeting(state) {
     var m = V.meetingView(state, state.status.now);
     var nt = $('nextText');
@@ -617,6 +750,7 @@ dialog textarea { min-height: 220px; resize: vertical; }
     $('meeting').classList.toggle('stale', m.stale.stale);
     setText($('staleNote'), m.stale.stale ? m.stale.text + '（整理が止まっているか遅れています。上の帯を見てください）' : '');
     setText($('updated'), m.updatedText);
+    renderScript(state);
   }
 
   // ── 会議の前と後 ─────────────────────────────────────────
